@@ -1,0 +1,289 @@
+<!doctype html>
+<html style="margin: 0; padding: 0; height: 100%">
+<head>
+    <title>jscad-viewer</title>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
+</head>
+<body style="margin: 0; padding: 0; height: 100%">
+    <canvas style="margin: 0; padding: 0; position:absolute; height: 100%; width: 100%">Your browser does not seem to support HTML5 canvas.</canvas>
+    <script>
+        function perspective(fovy, aspect, near, far) {
+            const f = 1.0 / Math.tan(fovy / 2);
+            const nf = 1 / (near - far);
+            return [
+                f / aspect, 0, 0, 0,
+                0, f, 0, 0,
+                0, 0, (far + near) * nf, -1,
+                0, 0, 2 * far * near * nf, 0
+            ];
+        }
+        function norm(v) {
+            const len = Math.hypot(v[0], v[1], v[2]);
+            if (!len) return [0, 0, 0];
+            const inv_len = 1 / len;
+            return v.map(u => inv_len * u);
+        }
+        const dot3 = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+        const dot4 = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3];
+        const cross = (a, b) => [
+            a[1]*b[2] - a[2]*b[1],
+            a[2]*b[0] - a[0]*b[2],
+            a[0]*b[1] - a[1]*b[0],
+        ];
+        function lookAt(eye, center, up) {
+            const z = norm([eye[0] - center[0], eye[1] - center[1], eye[2] - center[2]]);
+            const x = norm(cross(up, z));
+            const y = norm(cross(z, x));
+            return [
+                x[0], y[0], z[0], 0,
+                x[1], y[1], z[1], 0,
+                x[2], y[2], z[2], 0,
+                -dot3(x, eye), -dot3(y, eye), -dot3(z, eye), 1,
+            ];
+        }
+        function mul(a, b) {
+            const a0 = [a[ 0], a[ 4], a[ 8], a[12]];
+            const a1 = [a[ 1], a[ 5], a[ 9], a[13]];
+            const a2 = [a[ 2], a[ 6], a[10], a[14]];
+            const a3 = [a[ 3], a[ 7], a[11], a[15]];
+            const b0 = [b[ 0], b[ 1], b[ 2], b[ 3]];
+            const b1 = [b[ 4], b[ 5], b[ 6], b[ 7]];
+            const b2 = [b[ 8], b[ 9], b[10], b[11]];
+            const b3 = [b[12], b[13], b[14], b[15]];
+            return [
+                dot4(b0, a0), dot4(b0, a1), dot4(b0, a2), dot4(b0, a3),
+                dot4(b1, a0), dot4(b1, a1), dot4(b1, a2), dot4(b1, a3),
+                dot4(b2, a0), dot4(b2, a1), dot4(b2, a2), dot4(b2, a3),
+                dot4(b3, a0), dot4(b3, a1), dot4(b3, a2), dot4(b3, a3),
+            ];
+        }
+
+        const setup = () => {
+            // Get webgl context
+            const canvas = document.querySelector("canvas");
+            canvas.width = canvas.clientWidth;
+            canvas.height = canvas.clientHeight;
+            const gl = canvas.getContext("webgl2") || canvas.getContext("experimental-webgl");
+            if (!gl)
+                throw "Could not get webgl context";
+
+            // Setup global gl variables
+            gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+            //gl.clearColor(1, 1, 1, 1);
+            gl.clearColor(0, 0, 0, 1);
+            gl.enable(gl.DEPTH_TEST);
+            gl.depthFunc(gl.LEQUAL);
+
+            let data = [];
+            // Setup vertices
+            gl.enableVertexAttribArray(0);
+            const buf = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+            gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+
+            // Setup program
+            const prog = gl.createProgram();
+            {
+                // Compile vertex shader
+                const vss = `#version 300 es
+                    precision highp float;
+                    in vec3 pos;
+                    uniform mat4 mat;
+                    uniform vec3 dir;
+                    out vec3 vpos;
+                    out vec3 vdir;
+                    void main() {
+                        vpos = pos;
+                        vdir = dir;
+                        gl_Position = mat * vec4(pos, 1.0);
+                    }
+                `;
+                var vs = gl.createShader(gl.VERTEX_SHADER);
+                gl.shaderSource(vs, vss);
+                gl.compileShader(vs);
+                console.log(gl.getShaderInfoLog(vs));
+
+                // Compile fragment shader
+                const fss = `#version 300 es
+                    precision mediump float;
+                    uniform vec3 color;
+                    in vec3 vpos;
+                    in vec3 vdir;
+                    out vec4 FragColor;
+                    void main() {
+                        vec3 normal = normalize(cross(dFdx(vpos), dFdy(vpos)));
+                        float factor = 0.2 + 0.4*abs(dot(normal, normalize(vec3(1, 1, 1)))) + 0.4*abs(dot(normal, vdir));
+                        FragColor = vec4(factor * color, 1.0);
+                    }
+                `;
+                var fs = gl.createShader(gl.FRAGMENT_SHADER);
+                gl.shaderSource(fs,fss);
+                gl.compileShader(fs);
+                console.log(gl.getShaderInfoLog(fs));
+
+                // Link shader Program
+                gl.attachShader(prog, vs);
+                gl.attachShader(prog, fs);
+                gl.linkProgram(prog);
+                if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+                    console.log(gl.getProgramInfoLog(program));
+                    throw "Could not link program";
+                }
+
+                // Delete vertex and fragment shader
+                gl.detachShader(prog, vs);
+                gl.detachShader(prog, fs);
+                gl.deleteShader(vs);
+                gl.deleteShader(fs);
+            }
+            // Get locations
+            const dirLoc   = gl.getUniformLocation(prog, "dir");
+            const matLoc   = gl.getUniformLocation(prog, "mat");
+            const colorLoc = gl.getUniformLocation(prog, "color");
+
+            // Use the program
+            gl.useProgram(prog);
+
+            let camera_look_at = [0, 0, 0];
+            let yaw = Math.PI;
+            let pitch = 0;
+            let dist = 30;
+            const render = () => {
+                gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+                const lookAtMatrix = lookAt(
+                    [
+                        camera_look_at[0] - dist * Math.sin(-yaw) * Math.cos(-pitch),
+                        camera_look_at[1] - dist *                  Math.sin( pitch),
+                        camera_look_at[2] - dist * Math.cos( yaw) * Math.cos( pitch)
+                    ],
+                    camera_look_at,
+                    [
+                        Math.sin( yaw) * Math.sin( pitch),
+                                         Math.cos( pitch),
+                        Math.cos(-yaw) * Math.sin(-pitch)
+                    ]
+                );
+                const perspectiveMatrix = perspective(
+                    0.2 * Math.PI,
+                    gl.drawingBufferWidth / gl.drawingBufferHeight,
+                    0.01,
+                    1000
+                );
+                const uniformMatrix = mul(perspectiveMatrix, lookAtMatrix);
+                gl.uniformMatrix4fv(matLoc, false, new Float32Array(uniformMatrix));
+                gl.uniform3f(
+                    dirLoc,
+                    Math.sin(-yaw) * Math.cos(-pitch),
+                                     Math.sin( pitch),
+                    Math.cos( yaw) * Math.cos( pitch)
+                );
+
+                let i = 0;
+                for (let u = 0; u < data.length; ++u) {
+                    let c = data[u].color;
+                    if (!c)
+                        c = [1, 1, 1];
+                    gl.uniform3f(colorLoc, c[0], c[1], c[2]);
+                    const len = 3*data[u].polygons.length;
+                    gl.drawArrays(gl.TRIANGLES, i, len);
+                    i += len;
+                }
+            }
+
+            const updateData = () => {
+                fetch(window.location.search.substring(1), {cache: "no-store"})
+                    .then(response => response.json())
+                    .then(json => {
+                        if (JSON.stringify(data) != JSON.stringify(json)) {
+                            console.log("update")
+                            data = json;
+                            const points = data.flatMap(d => d.polygons.flatMap(p => p.vertices));
+                            const min = [ 10000,  10000,  10000];
+                            const max = [-10000, -10000, -10000];
+                            for (const p of points) {
+                                for (let i = 0; i < 3; ++i) {
+                                    if (p[i] < min[i]) {
+                                        min[i] = p[i];
+                                    }
+                                    if (p[i] > max[i]) {
+                                        max[i] = p[i];
+                                    }
+                                }
+                            }
+                            console.log(`min: ${min}`)
+                            console.log(`max: ${max}`)
+
+                            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(points.flat()), gl.STATIC_DRAW);
+                            render();
+                        }
+                        setTimeout(updateData, 1000);
+                    });
+            };
+            updateData();
+
+            let last_mouse_down_pos;
+            let mouse_down = false;
+
+            window.addEventListener("keydown", e => {
+                if (e.key != "r")
+                    return;
+                camera_look_at = [0, 0, 0];
+                yaw = Math.PI;
+                pitch = 0;
+                dist = 30;
+                mouse_down = false;
+                render();
+            }, false);
+            canvas.addEventListener("wheel", e => {
+                dist *= 1 + 0.001 * e.deltaY;
+                render();
+            }, false);
+            canvas.addEventListener("mousedown", e => {
+                mouse_down = true;
+                last_mouse_down_pos = [e.clientX, e.clientY];
+            }, false);
+            canvas.addEventListener("mousemove", e => {
+                if (!mouse_down)
+                    return;
+                const pos = [e.clientX, e.clientY];
+                const prev_pos = last_mouse_down_pos;
+                last_mouse_down_pos = pos;
+                const diff = [pos[0] - prev_pos[0], pos[1] - prev_pos[1]];
+                if (e.shiftKey) {
+                    const f = 1 * dist / gl.drawingBufferHeight;
+                    camera_look_at[0] += f * Math.cos( yaw) * diff[0],
+                    camera_look_at[2] += f * Math.sin( yaw) * diff[0]
+                    camera_look_at[0] += f * Math.sin( yaw) * Math.sin( pitch) * diff[1],
+                    camera_look_at[1] += f *                  Math.cos( pitch) * diff[1],
+                    camera_look_at[2] += f * Math.cos(-yaw) * Math.sin(-pitch) * diff[1]
+                } else {
+                    const f = 1;
+                    yaw += f * diff[0] / gl.drawingBufferHeight;
+                    while (yaw >  Math.PI)
+                        yaw -= 2 * Math.PI;
+                    while (yaw < -Math.PI)
+                        yaw += 2 * Math.PI;
+                    pitch -= f * diff[1] / gl.drawingBufferHeight;
+                    if (pitch < (-Math.PI / 2))
+                        pitch =  -Math.PI / 2;
+                    if (pitch > ( Math.PI / 2))
+                        pitch =   Math.PI / 2;
+                }
+                render();
+            }, false);
+            canvas.addEventListener("mouseup", e => {
+                mouse_down = false;
+            }, false);
+            canvas.addEventListener("mouseleave", e => {
+                mouse_down = false;
+            }, false);
+        }
+        window.addEventListener("load", setup, false);
+    </script>
+</body>
+</html>
